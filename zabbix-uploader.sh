@@ -137,16 +137,22 @@ get_graphs() {
     
 }
 
-
 get_auth_cookie() {
     local login_url="${ZABBIX_URL%/api_jsonrpc.php}/index.php"
-    local cookie_file="/tmp/zabbix_cookie_$$"
-
     curl -s -c "${cookie_file}" -d "name=${ZABBIX_USER}&password=${ZABBIX_PASSWORD}&autologin=1&enter=Sign in" \
          -H 'Content-Type: application/x-www-form-urlencoded' \
          "${login_url}" > /dev/null
+    cookie=$(cat "${cookie_file}" | grep zbx_session | awk '{print $7}')
+    if [[ -z "$cookie" ]]; then
+        echo_err "❌ Failed to retrieve session cookie!"
+        return 1
+    fi
+    return 0
+}
 
-    echo_dbg "${cookie_file}"
+cast_date_for_zabbix_url(){
+  local my_date=${1}
+  echo ${my_date} | sed 's/ /%20/g' | sed 's/:/%3A/g'
 }
 
 download_graph() {
@@ -157,16 +163,16 @@ download_graph() {
     local dest_dir=${5}
     local width=${6:-1200}
     local height=${7:-600}
-    
 
-    local cookie_file
-    cookie_file=$(get_auth_cookie)
-
+    local cookie
+    local cookie_file="/tmp/zabbix_cookie_$$"
+    get_auth_cookie || return 1
+      
     local graph_url="${ZABBIX_URL%/api_jsonrpc.php}/chart2.php"
     local params=(
         "graphid=${graph_id}"
-        "from=${from}"
-        "to=${to}"
+        "from=$(cast_date_for_zabbix_url "${from}")"
+        "to=$(cast_date_for_zabbix_url "${to}")"
         "width=${width}"
         "height=${height}"
         "profileIdx=web.graphs.filter"
@@ -174,31 +180,31 @@ download_graph() {
     local url_params=$(IFS="&"; echo "${params[*]}")
     local output_file="${graph_title}.png"
 
-    echo "Downloading graph to ${output_file}..."
-    curl -s -b "${cookie_file}" -o "${dest_dir}/${output_file}" "${graph_url}?${url_params}"
+    echo_dbg "Downloading graph: ${graph_url}?${url_params}..."
+    curl -b "${cookie_file}" -o "${dest_dir}/${output_file}" "${graph_url}?${url_params}"
     # Curl status is always 1 for unsupported protocol but it is wortking
-    if [[ ${?} -eq 0 ]] || [[ ${?} -eq 1 ]]; then
-        echo_dbg "Graph downloaded successfully to ${output_file}"
+    if [[ $? -eq 0 || $? -eq 1 ]] && [[ -f "${dest_dir}/${output_file}" && -s "${dest_dir}/${output_file}" ]]; then
+      echo_dbg "✅ Graph successfully downloaded: ${output_file}"
     else
-        echo_dbg "Failed to download graph, error: ${?}"
-        rm -f "${output_file}"
+      echo_err "❌ Failed to download graph: ${output_file}, curl error code: $?"
+      rm -f "${output_file}"
     fi
 
     rm -f "${cookie_file}"
 }
 
 main() {
-
   if [[ "${@}" =~ *"--help"* ]] || [[ "${@}}" =~ *"-h"* ]]; then
     usage
     return 0
   elif [[ $# -ne 3 ]]; then
+    echo_err "Expected 3 arguments: hostname, start_date, and end_date"
     return 1
   elif [[ -z "${ZABBIX_TOKEN}" ]] || 
     [[ -z "${ZABBIX_URL}" ]] || 
     [[ -z "${ZABBIX_USER}" ]] ||
     [[ -z "${ZABBIX_PASSWORD}" ]]; then
-    echo_err "Environnement variable issue"
+    echo_err "Environment variable issue"
     return 2
   fi
   validate_url || return 3
@@ -215,7 +221,6 @@ main() {
     return 2
   fi
   echo_dbg "Host ID: ${host_id}"
-  
 
   echo_dbg "STEP 2: Get graph list"
   local declare -A graphs_list
@@ -227,15 +232,16 @@ main() {
 
   echo_dbg "Graph list: ${graphs_list}"
   echo_dbg "Graphs dictionary content:"
-  local dest_dir=/tmp/${hostname}_${from}_${to}
-  if ! [[ -f ${dest_dir} ]]; then
-    mkdir ${dest_dir}
+  local dest_dir="${HOME}/Images/${hostname}_${from// /_}_${to// /_}"
+  if [[ -d ${dest_dir} ]]; then
+    rm -rf ${dest_dir}
   fi
+  mkdir -p ${dest_dir}
+  echo_dbg "${dest_dir}"
   for id in "${!graphs_list[@]}"; do
     echo_dbg "\tGraph ID: $id -> Name: ${graphs_list[$id]}"
-    download_graph ${id} ${graphs_list[$id]} ${from} ${to} ${dest_dir}
+    download_graph "${id}" "${graphs_list[$id]}" "${from}" "${to}" "${dest_dir}"
   done
-    
 }
 
 main "${@}" || usage
